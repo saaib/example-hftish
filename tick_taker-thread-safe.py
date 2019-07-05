@@ -6,6 +6,7 @@ import threading
 import argparse
 import pandas as pd
 import numpy as np
+from random import randint
 import alpaca_trade_api as tradeapi
 from StockInvestHawk.utils.Logger import Logger
 
@@ -48,7 +49,7 @@ class Quote():
         # Update bid and ask sizes and timestamp
         self.bid_size = data.bidsize
         self.ask_size = data.asksize
-        print(data)
+        logger.debug(f'Update: data: {data}')
 
         # Check if there has been a level change
         if (
@@ -183,12 +184,14 @@ def run(args):
     @conn.on(r'Q\.' + symbol)
     async def on_quote(conn, channel, data):
         # Quote update received
-        logger.trace(f'conn: {conn}, channel: {channel}, data: {data}')
+        logger.trace(
+            f'on_quote: conn: {conn}, channel: {channel}, data: {data}')
         quote.update(data)
 
     @conn.on(r'T\.' + symbol)
     async def on_trade(conn, channel, data):
-        logger.trace(f'conn: {conn}, channel: {channel}, data: {data}')
+        logger.trace(
+            f'on_trade: conn: {conn}, channel: {channel}, data: {data}')
         if quote.traded:
             return
         # We've received a trade and might be ready to follow it
@@ -218,21 +221,23 @@ def run(args):
                 # Everything looks right, so we submit our buy at the ask
                 try:
                     logger.trace('Buying...')
+                    id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
+                    logger.trace(f'Updating order ammount of {id} to 0.')
                     with ORDER_LOCK:
+                        position.update_order_ammount(id, 0)
                         o = api.submit_order(
-                            symbol=symbol, qty=args.quantity, side='buy',
+                            client_order_id=id, symbol=symbol, qty=args.quantity, side='buy',
                             type='limit', time_in_force='day',
                             limit_price=str(quote.ask)
                         )
-                        logger.trace(f'Updating order ammount of {o.id} to 0.')
-                        position.update_order_ammount(o.id, 0)
-                        #position.orders_filled_amount[o.id] = 0
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
                     position.update_pending_buy_shares(args.quantity)
-                    logger.console(f'ID: {o.id}, Buy at {quote.ask}')
+                    logger.console(
+                        f'ID: {o.client_order_id}, Buy at {quote.ask}')
                     quote.traded = True
                 except Exception as e:
+                    logger.trace(e)
                     logger.console(e)
             elif (
                 data.price == quote.bid
@@ -244,21 +249,24 @@ def run(args):
                 # Everything looks right, so we submit our sell at the bid
                 try:
                     logger.trace('Selling...')
+                    id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
                     with ORDER_LOCK:
+                        position.update_order_ammount(id, 0)
                         o = api.submit_order(
-                            symbol=symbol, qty=args.quantity, side='sell',
+                            client_order_id=id, symbol=symbol, qty=args.quantity, side='sell',
                             type='limit', time_in_force='day',
-                            limit_price=str(quote.bid)
+                            limit_price=str(float(quote.bid) + 0.01)
                         )
-                        logger.trace(f'Updating order ammount of {o.id} to 0.')
-                        position.update_order_ammount(o.id, 0)
-                        #position.orders_filled_amount[o.id] = 0
+                        logger.trace(
+                            f'Updating order ammount of {o.client_order_id} to 0.')
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
                     position.update_pending_sell_shares(args.quantity)
-                    logger.console(f'ID: {o.id}, Sell at {quote.bid}')
+                    logger.console(
+                        f'ID: {o.client_order_id}, Sell at {quote.bid}')
                     quote.traded = True
                 except Exception as e:
+                    logger.trace(e)
                     logger.console(e)
 
     @conn.on(r'trade_updates')
@@ -267,28 +275,45 @@ def run(args):
         # update our position with the new information.
         with ORDER_LOCK:
             pass
-        logger.trace(f'conn: {conn}, channel: {channel}, data: {data}')
+        logger.trace(
+            f'on_trade_updates: conn: {conn}, channel: {channel}, data: {data}')
         event = data.event
         if event == 'fill':
             if data.order['side'] == 'buy':
                 position.update_total_shares(
                     int(data.order['filled_qty'])
                 )
+                try:
+                    id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
+                    with ORDER_LOCK:
+                        position.update_order_ammount(
+                            data.order['client_order_id'], 0)
+                        o = api.submit_order(
+                            client_order_id=id, symbol=data.order['symbol'], qty=data.order['filled_qty'], side='sell',
+                            type='limit', time_in_force='day',
+                            limit_price=str(float(data.price) + 0.01)
+                        )
+                    logger.trace(
+                        f'Updating order ammount of {o.client_order_id} to 0.')
+                    position.update_pending_sell_shares(args.quantity)
+                except Exception as e:
+                    logger.trace(e)
+                    logger.console(e)
             else:
                 position.update_total_shares(
                     -1 * int(data.order['filled_qty'])
                 )
             position.remove_pending_order(
-                data.order['id'], data.order['side']
+                data.order['client_order_id'], data.order['side']
             )
         elif event == 'partial_fill':
             position.update_filled_amount(
-                data.order['id'], int(data.order['filled_qty']),
+                data.order['client_order_id'], int(data.order['filled_qty']),
                 data.order['side']
             )
         elif event == 'canceled' or event == 'rejected':
             position.remove_pending_order(
-                data.order['id'], data.order['side']
+                data.order['client_order_id'], data.order['side']
             )
 
     conn.run(
