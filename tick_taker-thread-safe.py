@@ -195,14 +195,14 @@ def run(args):
         if quote.traded:
             return
         # We've received a trade and might be ready to follow it
-#         if (
-#             data.timestamp <= (
-#                 quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
-#             )
-#         ):
-#             # The trade came too close to the quote update
-#             # and may have been for the previous level
-#             return
+        if (
+            data.timestamp <= (
+                quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
+            )
+        ):
+            # The trade came too close to the quote update
+            # and may have been for the previous level
+            return
         if data.size >= args.quantity:
             # The trade was large enough to follow, so we check to see if
             # we're ready to trade. We also check to see that the
@@ -222,8 +222,8 @@ def run(args):
                 try:
                     logger.trace('Buying...')
                     id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
-                    logger.trace(f'Updating order ammount of {id} to 0.')
                     with ORDER_LOCK:
+                        logger.trace(f'Updating order ammount of {id} to 0.')
                         position.update_order_ammount(id, 0)
                         o = api.submit_order(
                             client_order_id=id, symbol=symbol, qty=args.quantity, side='buy',
@@ -235,6 +235,8 @@ def run(args):
                     position.update_pending_buy_shares(args.quantity)
                     logger.console(
                         f'ID: {o.client_order_id}, Buy at {quote.ask}')
+                    logger.trace(
+                        f'Updated position: {position.orders_filled_amount}')
                     quote.traded = True
                 except Exception as e:
                     logger.trace(e)
@@ -251,6 +253,7 @@ def run(args):
                     logger.trace('Selling...')
                     id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
                     with ORDER_LOCK:
+                        logger.trace(f'Updating order ammount of {id} to 0.')
                         position.update_order_ammount(id, 0)
                         o = api.submit_order(
                             client_order_id=id, symbol=symbol, qty=args.quantity, side='sell',
@@ -260,8 +263,10 @@ def run(args):
                         logger.trace(
                             f'Updating order ammount of {o.client_order_id} to 0.')
                     # Approximate an IOC order by immediately cancelling
-                    api.cancel_order(o.id)
+                    # api.cancel_order(o.id)
                     position.update_pending_sell_shares(args.quantity)
+                    logger.trace(
+                        f'Updated position: {position.orders_filled_amount}')
                     logger.console(
                         f'ID: {o.client_order_id}, Sell at {quote.bid}')
                     quote.traded = True
@@ -276,7 +281,7 @@ def run(args):
         with ORDER_LOCK:
             pass
         logger.trace(
-            f'on_trade_updates: conn: {conn}, channel: {channel}, data: {data}')
+            f'on_trade_updates: conn: {conn}, channel: {channel}, data: {data}, position: {position.orders_filled_amount}')
         event = data.event
         if event == 'fill':
             if data.order['side'] == 'buy':
@@ -293,9 +298,13 @@ def run(args):
                             type='limit', time_in_force='day',
                             limit_price=str(float(data.price) + 0.01)
                         )
+                        # Approximate an IOC order by immediately cancelling
+                        # api.cancel_order(o.id)
                     logger.trace(
                         f'Updating order ammount of {o.client_order_id} to 0.')
                     position.update_pending_sell_shares(args.quantity)
+                    logger.trace(
+                        f'Updated position: {position.orders_filled_amount}')
                 except Exception as e:
                     logger.trace(e)
                     logger.console(e)
