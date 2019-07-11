@@ -102,26 +102,36 @@ class Position():
         self.total_shares = 0
 
     def update_order_ammount(self, order, ammount):
+        logger.trace('Begin')
         self.orders_filled_amount[order] = ammount
+        logger.trace('End')
 
     def get_order_ammount(self, order):
+        logger.trace('Begin')
         with ORDER_LOCK:
             return self.orders_filled_amount.get(order)
 
     def del_order(self, order):
+        logger.trace('Begin')
         with ORDER_LOCK:
             if self.orders_filled_amount.get(order):
                 del self.orders_filled_amount[order]
+        logger.trace('End')
 
     def update_pending_buy_shares(self, quantity):
+        logger.trace('Begin')
         with ORDER_LOCK:
             self.pending_buy_shares += quantity
+        logger.trace('End')
 
     def update_pending_sell_shares(self, quantity):
+        logger.trace('Begin')
         with ORDER_LOCK:
             self.pending_sell_shares += quantity
+        logger.trace('End')
 
     def update_filled_amount(self, order_id, new_amount, side):
+        logger.trace('Begin')
         old_amount = self.get_order_ammount(order_id)
         if old_amount:
             if new_amount > old_amount:
@@ -135,8 +145,10 @@ class Position():
         else:
             logger.console(
                 f'Order ID: {order_id} not present on current orders.')
+        logger.trace('End')
 
     def remove_pending_order(self, order_id, side):
+        logger.trace('Begin')
         old_amount = self.get_order_ammount(order_id)
         if old_amount:
             if side == 'buy':
@@ -150,10 +162,13 @@ class Position():
         else:
             logger.console(
                 f'Order ID: {order_id} not present on current orders.')
+        logger.trace('End')
 
     def update_total_shares(self, quantity):
+        logger.trace('Begin')
         with ORDER_LOCK:
             self.total_shares += quantity
+        logger.trace('End')
 
 
 def run(args):
@@ -169,7 +184,9 @@ def run(args):
     elif 'key_id' in opts and opts['key_id'].startswith('PK'):
         opts['base_url'] = 'https://paper-api.alpaca.markets'
     # Create an API object which can be used to submit orders, etc.
+    print('Creating the API.')
     api = tradeapi.REST(**opts)
+    print('API created.')
 
     symbol = symbol.upper()
     quote = Quote(args)
@@ -178,17 +195,19 @@ def run(args):
     position = Position(args)
 
     # Establish streaming connection
+    print('Connecting to the stream.')
     conn = tradeapi.StreamConn(**opts)
+    print('Connection created.')
 
     # Define our message handling
-    @conn.on(r'Q\.' + symbol)
+    @conn.on(r'Q.' + symbol)
     async def on_quote(conn, channel, data):
         # Quote update received
         logger.trace(
             f'on_quote: conn: {conn}, channel: {channel}, data: {data}')
         quote.update(data)
 
-    @conn.on(r'T\.' + symbol)
+    @conn.on(r'T.' + symbol)
     async def on_trade(conn, channel, data):
         logger.trace(
             f'on_trade: conn: {conn}, channel: {channel}, data: {data}')
