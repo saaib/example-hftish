@@ -1,7 +1,14 @@
+import sys
+sys.path.append('lib/alpacahq/alpaca-trade-api-python')
+sys.path.append('../alpaca-trade-api-python')
+sys.path.append('../..')
 import argparse
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
+from StockInvestHawk.utils.Logger import Logger
+
+logger = Logger()
 
 
 class Quote():
@@ -16,7 +23,8 @@ class Quote():
     algorithm is not tuned to trade.
     """
 
-    def __init__(self):
+    def __init__(self, args):
+        self.args = args
         self.prev_bid = 0
         self.prev_ask = 0
         self.prev_spread = 0
@@ -43,7 +51,7 @@ class Quote():
         if (
             self.bid != data.bidprice
             and self.ask != data.askprice
-            and round(data.askprice - data.bidprice, 2) == .01
+            and round(data.askprice - data.bidprice, 2) == self.args.delta_price
         ):
             # Update bids and asks and time of level change
             self.prev_bid = self.bid
@@ -54,14 +62,23 @@ class Quote():
             # Update spreads
             self.prev_spread = round(self.prev_ask - self.prev_bid, 3)
             self.spread = round(self.ask - self.bid, 3)
-            print(
-                'Level change:', self.prev_bid, self.prev_ask,
-                self.prev_spread, self.bid, self.ask, self.spread, flush=True
+            logger.console(
+                f'Level change: {self.prev_bid}, {self.prev_ask}, '
+                f'{self.prev_spread}, {self.bid}, {self.ask}, {self.spread}, '
+                f'{self.bid_size}, {self.ask_size}'
             )
             # If change is from one penny spread level to a different penny
             # spread level, then initialize for new level (reset stale vars)
-            if self.prev_spread == 0.01:
+            if self.prev_spread == self.args.delta_price:
                 self.reset()
+
+    def __str__(self):
+        return (f'Prev Bid: {self.prev_bid}, Prev Ask:{self.prev_ask}, '
+                f'Pref Spread: {self.prev_spread}, Bid: {self.bid}, '
+                f'Ask: {self.ask}, Bid Size: {self.bid_size}, '
+                f'Ask Size: {self.ask_size}, Spread: {self.spread}, '
+                f'Traded: {self.traded}, Level Ct: {self.level_ct}, '
+                f'Time: {self.time}')
 
 
 class Position():
@@ -73,7 +90,8 @@ class Position():
     sell as well as how many have been filled into our account.
     """
 
-    def __init__(self):
+    def __init__(self, args):
+        self.args = args
         self.orders_filled_amount = {}
         self.pending_buy_shares = 0
         self.pending_sell_shares = 0
@@ -86,23 +104,31 @@ class Position():
         self.pending_sell_shares += quantity
 
     def update_filled_amount(self, order_id, new_amount, side):
-        old_amount = self.orders_filled_amount[order_id]
-        if new_amount > old_amount:
-            if side == 'buy':
-                self.update_pending_buy_shares(old_amount - new_amount)
-                self.update_total_shares(new_amount - old_amount)
-            else:
-                self.update_pending_sell_shares(old_amount - new_amount)
-                self.update_total_shares(old_amount - new_amount)
-            self.orders_filled_amount[order_id] = new_amount
+        old_amount = self.orders_filled_amount.get(order_id)
+        if old_amount:
+            if new_amount > old_amount:
+                if side == 'buy':
+                    self.update_pending_buy_shares(old_amount - new_amount)
+                    self.update_total_shares(new_amount - old_amount)
+                else:
+                    self.update_pending_sell_shares(old_amount - new_amount)
+                    self.update_total_shares(old_amount - new_amount)
+                self.orders_filled_amount[order_id] = new_amount
+        else:
+            logger.console(
+                f'Order ID: {order_id} not present on current orders.')
 
     def remove_pending_order(self, order_id, side):
-        old_amount = self.orders_filled_amount[order_id]
-        if side == 'buy':
-            self.update_pending_buy_shares(old_amount - 100)
+        old_amount = self.orders_filled_amount.get(order_id)
+        if old_amount:
+            if side == 'buy':
+                self.update_pending_buy_shares(old_amount - self.args.quantity)
+            else:
+                self.update_pending_sell_shares(old_amount - self.args.quantity)
+            del self.orders_filled_amount[order_id]
         else:
-            self.update_pending_sell_shares(old_amount - 100)
-        del self.orders_filled_amount[order_id]
+            logger.console(
+                f'Order ID: {order_id} not present on current orders.')
 
     def update_total_shares(self, quantity):
         self.total_shares += quantity
@@ -110,7 +136,7 @@ class Position():
 
 def run(args):
     symbol = args.symbol
-    max_shares = args.quantity
+    max_shares = args.max_shares
     opts = {}
     if args.key_id:
         opts['key_id'] = args.key_id
@@ -124,10 +150,10 @@ def run(args):
     api = tradeapi.REST(**opts)
 
     symbol = symbol.upper()
-    quote = Quote()
+    quote = Quote(args)
     qc = 'Q.%s' % symbol
     tc = 'T.%s' % symbol
-    position = Position()
+    position = Position(args)
 
     # Establish streaming connection
     conn = tradeapi.StreamConn(**opts)
@@ -143,64 +169,68 @@ def run(args):
         if quote.traded:
             return
         # We've received a trade and might be ready to follow it
-        if (
-            data.timestamp <= (
-                quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
-            )
-        ):
-            # The trade came too close to the quote update
-            # and may have been for the previous level
-            return
-        if data.size >= 100:
+#         if (
+#             data.timestamp <= (
+#                 quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
+#             )
+#         ):
+#             # The trade came too close to the quote update
+#             # and may have been for the previous level
+#             return
+        if data.size >= args.quantity:
             # The trade was large enough to follow, so we check to see if
             # we're ready to trade. We also check to see that the
             # bid vs ask quantities (order book imbalance) indicate
             # a movement in that direction. We also want to be sure that
             # we're not buying or selling more than we should.
+            logger.console(
+                f'Analyze buy/sell...\n\tData: {data}\n\tQuote: {quote}')
             if (
                 data.price == quote.ask
                 and quote.bid_size > (quote.ask_size * 1.8)
                 and (
                     position.total_shares + position.pending_buy_shares
-                ) < max_shares - 100
+                ) < args.max_shares - args.quantity
             ):
                 # Everything looks right, so we submit our buy at the ask
                 try:
                     o = api.submit_order(
-                        symbol=symbol, qty='100', side='buy',
+                        symbol=symbol, qty=args.quantity, side='buy',
                         type='limit', time_in_force='day',
                         limit_price=str(quote.ask)
                     )
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
-                    position.update_pending_buy_shares(100)
+                    position.update_pending_buy_shares(args.quantity)
                     position.orders_filled_amount[o.id] = 0
-                    print('Buy at', quote.ask, flush=True)
+                    logger.console(
+                        f'ID: {o.id}, Buy at {quote.ask}')
                     quote.traded = True
                 except Exception as e:
-                    print(e)
+                    logger.console(e)
             elif (
                 data.price == quote.bid
                 and quote.ask_size > (quote.bid_size * 1.8)
                 and (
                     position.total_shares - position.pending_sell_shares
-                ) >= 100
+                ) >= args.quantity
             ):
                 # Everything looks right, so we submit our sell at the bid
                 try:
                     o = api.submit_order(
-                        symbol=symbol, qty='100', side='sell',
+                        symbol=symbol, qty=args.quantity, side='sell',
                         type='limit', time_in_force='day',
                         limit_price=str(quote.bid)
                     )
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
-                    position.update_pending_sell_shares(100)
+                    position.update_pending_sell_shares(args.quantity)
                     position.orders_filled_amount[o.id] = 0
-                    print('Sell at', quote.bid, flush=True)
+                    logger.console(
+                        f'ID: {o.id}, Sell at {quote.bid}')
                     quote.traded = True
                 except Exception as e:
-                    print(e)
+                    logger.console(e)
 
     @conn.on(r'trade_updates')
     async def on_trade_updates(conn, channel, data):
@@ -241,8 +271,16 @@ if __name__ == '__main__':
         help='Symbol you want to trade.'
     )
     parser.add_argument(
-        '--quantity', type=int, default=500,
-        help='Maximum number of shares to hold at once. Minimum 100.'
+        '--quantity', type=int, default=100,
+        help='Maximum number of shares to hold at once. Minimum 1.'
+    )
+    parser.add_argument(
+        '--max-shares', type=int, default=100,
+        help='Maximum number of shares to hold at once. Maximum 100.'
+    )
+    parser.add_argument(
+        '--delta-price', type=float, default=.01,
+        help='Delta between ask/bid price to consider purchase.'
     )
     parser.add_argument(
         '--key-id', type=str, default=None,
@@ -257,5 +295,5 @@ if __name__ == '__main__':
         help='set https://paper-api.alpaca.markets if paper trading',
     )
     args = parser.parse_args()
-    assert args.quantity >= 100
+    assert args.quantity >= 1
     run(args)
