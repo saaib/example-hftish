@@ -2,6 +2,7 @@ import sys
 sys.path.append('lib/alpacahq/alpaca-trade-api-python')
 sys.path.append('../alpaca-trade-api-python')
 sys.path.append('../..')
+import time
 import threading
 import argparse
 import pandas as pd
@@ -12,7 +13,7 @@ from StockInvestHawk.utils.Logger import Logger
 
 logger = Logger()
 ORDER_LOCK = threading.Lock()
-
+log_trace = 1
 
 class Quote():
     """
@@ -39,6 +40,7 @@ class Quote():
         self.traded = True
         self.level_ct = 1
         self.time = 0
+        self.mean_price = 0
 
     def reset(self):
         # Called when a level change happens
@@ -65,7 +67,7 @@ class Quote():
             self.time = data.timestamp
             # Update spreads
             self.prev_spread = round(self.prev_ask - self.prev_bid, 3)
-            self.spread = round(self.ask - self.bid, 3)
+            self.spread = round(self.ask - self.bid, 2)
             logger.console(
                 f'Level change: {self.prev_bid}, {self.prev_ask}, '
                 f'{self.prev_spread}, {self.bid}, {self.ask}, {self.spread}, '
@@ -100,40 +102,43 @@ class Position():
         self.pending_buy_shares = 0
         self.pending_sell_shares = 0
         self.total_shares = 0
+        self.ready = 1
 
     def update_order_ammount(self, order, ammount):
         logger.trace('Begin')
-        self.orders_filled_amount[order] = ammount
+        with ORDER_LOCK:
+            self.orders_filled_amount[order] = ammount
         logger.trace('End')
 
     def get_order_ammount(self, order):
         logger.trace('Begin')
-        with ORDER_LOCK:
-            return self.orders_filled_amount.get(order)
+#         with ORDER_LOCK:
+        return self.orders_filled_amount.get(order)
 
     def del_order(self, order):
         logger.trace('Begin')
-        with ORDER_LOCK:
-            if self.orders_filled_amount.get(order):
-                del self.orders_filled_amount[order]
+#         with ORDER_LOCK:
+        if self.orders_filled_amount.get(order):
+            del self.orders_filled_amount[order]
         logger.trace('End')
 
     def update_pending_buy_shares(self, quantity):
         logger.trace('Begin')
-        with ORDER_LOCK:
-            self.pending_buy_shares += quantity
+#         with ORDER_LOCK:
+        self.pending_buy_shares += quantity
+        logger.console(f'Pending buying shares: {self.pending_buy_shares}')
         logger.trace('End')
 
     def update_pending_sell_shares(self, quantity):
         logger.trace('Begin')
-        with ORDER_LOCK:
-            self.pending_sell_shares += quantity
+#         with ORDER_LOCK:
+        self.pending_sell_shares += quantity
         logger.trace('End')
 
     def update_filled_amount(self, order_id, new_amount, side):
         logger.trace('Begin')
         old_amount = self.get_order_ammount(order_id)
-        if old_amount:
+        if old_amount is not None:
             if new_amount > old_amount:
                 if side == 'buy':
                     self.update_pending_buy_shares(old_amount - new_amount)
@@ -150,14 +155,14 @@ class Position():
     def remove_pending_order(self, order_id, side):
         logger.trace('Begin')
         old_amount = self.get_order_ammount(order_id)
-        if old_amount:
+        if old_amount is not None:
             if side == 'buy':
                 self.update_pending_buy_shares(
                     old_amount - self.args.quantity)
             else:
                 self.update_pending_sell_shares(
                     old_amount - self.args.quantity)
-            #del self.orders_filled_amount[order_id]
+            del self.orders_filled_amount[order_id]
             self.del_order(order_id)
         else:
             logger.console(
@@ -166,8 +171,8 @@ class Position():
 
     def update_total_shares(self, quantity):
         logger.trace('Begin')
-        with ORDER_LOCK:
-            self.total_shares += quantity
+#         with ORDER_LOCK:
+        self.total_shares += quantity
         logger.trace('End')
 
 
@@ -200,28 +205,28 @@ def run(args):
     print('Connection created.')
 
     # Define our message handling
-    @conn.on(r'Q.' + symbol)
+    @conn.on(r'Q')
     async def on_quote(conn, channel, data):
         # Quote update received
         logger.trace(
             f'on_quote: conn: {conn}, channel: {channel}, data: {data}')
         quote.update(data)
 
-    @conn.on(r'T.' + symbol)
+    @conn.on(r'T')
     async def on_trade(conn, channel, data):
         logger.trace(
             f'on_trade: conn: {conn}, channel: {channel}, data: {data}')
-        if quote.traded:
-            return
+        #if quote.traded:
+        #    return
         # We've received a trade and might be ready to follow it
-        if (
-            data.timestamp <= (
-                quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
-            )
-        ):
-            # The trade came too close to the quote update
-            # and may have been for the previous level
-            return
+        # if (
+        #    data.timestamp <= (
+        #        quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
+        #    )
+        #):
+        # The trade came too close to the quote update
+        # and may have been for the previous level
+        #    return
         if data.size >= args.quantity:
             # The trade was large enough to follow, so we check to see if
             # we're ready to trade. We also check to see that the
@@ -230,28 +235,37 @@ def run(args):
             # we're not buying or selling more than we should.
             logger.console(
                 f'Analyze buy/sell...\n\tData: {data}\n\tQuote: {quote}')
+            logger.console(
+                f'Position: {position.total_shares + position.pending_buy_shares}, Max: {args.max_shares - args.quantity}')
             if (
-                data.price == quote.ask
-                and quote.bid_size > (quote.ask_size * 1.8)
-                and (
+                data.price == quote.ask and
+                quote.bid_size > (quote.ask_size * 1.5) and
+                #quote.bid_size > quote.ask_size and
+                # and (
+                (
                     position.total_shares + position.pending_buy_shares
                 ) < args.max_shares - args.quantity
+                #quote.bid and
+                #position.ready
             ):
                 # Everything looks right, so we submit our buy at the ask
                 try:
+                    position.ready = 0
                     logger.trace('Buying...')
                     id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
-                    with ORDER_LOCK:
-                        logger.trace(f'Updating order ammount of {id} to 0.')
-                        position.update_order_ammount(id, 0)
-                        o = api.submit_order(
-                            client_order_id=id, symbol=symbol, qty=args.quantity, side='buy',
-                            type='limit', time_in_force='day',
-                            limit_price=str(quote.ask)
-                        )
+                    position.update_order_ammount(id, 0)
+#                     with ORDER_LOCK:
+                    logger.trace(f'Updating order ammount of {id} to 0.')
+                    o = api.submit_order(
+                        client_order_id=id, symbol=symbol, qty=args.quantity, side='buy',
+                        type='limit', time_in_force='day',
+                        # limit_price=str(quote.ask)
+                        limit_price=str(data.price)
+                    )
                     # Approximate an IOC order by immediately cancelling
-                    api.cancel_order(o.id)
                     position.update_pending_buy_shares(args.quantity)
+                    api.cancel_order(o.id)
+                    #time.sleep(5)
                     logger.console(
                         f'ID: {o.client_order_id}, Buy at {quote.ask}')
                     logger.trace(
@@ -262,25 +276,27 @@ def run(args):
                     logger.console(e)
             elif (
                 data.price == quote.bid
-                and quote.ask_size > (quote.bid_size * 1.8)
+                and quote.ask_size > (quote.bid_size * 1.2)
                 and (
+                #(
                     position.total_shares - position.pending_sell_shares
                 ) >= args.quantity
+                #0
             ):
                 # Everything looks right, so we submit our sell at the bid
                 try:
                     logger.trace('Selling...')
                     id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
-                    with ORDER_LOCK:
-                        logger.trace(f'Updating order ammount of {id} to 0.')
-                        position.update_order_ammount(id, 0)
-                        o = api.submit_order(
-                            client_order_id=id, symbol=symbol, qty=args.quantity, side='sell',
-                            type='limit', time_in_force='day',
-                            limit_price=str(float(quote.bid) + 0.01)
-                        )
-                        logger.trace(
-                            f'Updating order ammount of {o.client_order_id} to 0.')
+                    position.update_order_ammount(id, 0)
+#                     with ORDER_LOCK:
+                    logger.trace(f'Updating order ammount of {id} to 0.')
+                    o = api.submit_order(
+                        client_order_id=id, symbol=symbol, qty=args.quantity, side='sell',
+                        type='limit', time_in_force='day',
+                        limit_price=str(float(quote.bid) + 0.01)
+                    )
+                    logger.trace(
+                        f'Updating order ammount of {o.client_order_id} to 0.')
                     # Approximate an IOC order by immediately cancelling
                     # api.cancel_order(o.id)
                     position.update_pending_sell_shares(args.quantity)
@@ -293,32 +309,31 @@ def run(args):
                     logger.trace(e)
                     logger.console(e)
 
-    @conn.on(r'trade_updates')
+    @conn.on('trade_updates')
     async def on_trade_updates(conn, channel, data):
         # We got an update on one of the orders we submitted. We need to
         # update our position with the new information.
-        with ORDER_LOCK:
-            pass
-        logger.trace(
+        logger.debug(
             f'on_trade_updates: conn: {conn}, channel: {channel}, data: {data}, position: {position.orders_filled_amount}')
         event = data.event
         if event == 'fill':
             if data.order['side'] == 'buy':
+                logger.console(f'Buy of {data.order["symbol"]} ({data.order["filled_qty"]}) Filled.')
                 position.update_total_shares(
                     int(data.order['filled_qty'])
                 )
                 try:
                     id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
-                    with ORDER_LOCK:
-                        position.update_order_ammount(
-                            data.order['client_order_id'], 0)
-                        o = api.submit_order(
-                            client_order_id=id, symbol=data.order['symbol'], qty=data.order['filled_qty'], side='sell',
-                            type='limit', time_in_force='day',
-                            limit_price=str(float(data.price) + 0.01)
-                        )
-                        # Approximate an IOC order by immediately cancelling
-                        # api.cancel_order(o.id)
+                    position.update_order_ammount(data.order['client_order_id'], 0)
+               #      with ORDER_LOCK:
+                    logger.console(f'Submitting sale of stock {symbol} for {data.order["filled_qty"]} ')
+                    o = api.submit_order(
+                        client_order_id=id, symbol=data.order['symbol'], qty=data.order['filled_qty'], side='sell',
+                        type='limit', time_in_force='day',
+                        limit_price=str(float(data.price) + 0.01)
+                    )
+                    # Approximate an IOC order by immediately cancelling
+                    # api.cancel_order(o.id)
                     logger.trace(
                         f'Updating order ammount of {o.client_order_id} to 0.')
                     position.update_pending_sell_shares(args.quantity)
@@ -328,6 +343,8 @@ def run(args):
                     logger.trace(e)
                     logger.console(e)
             else:
+                position.ready = 1
+                logger.console(f'Order: {data.order["client_order_id"]}, Stock {data.order["symbol"]} ({data.order["filled_qty"]}) Sold')
                 position.update_total_shares(
                     -1 * int(data.order['filled_qty'])
                 )
@@ -340,9 +357,32 @@ def run(args):
                 data.order['side']
             )
         elif event == 'canceled' or event == 'rejected':
-            position.remove_pending_order(
-                data.order['client_order_id'], data.order['side']
-            )
+            position.remove_pending_order( data.order['client_order_id'], data.order['side'])
+            if data.order['side'] == 'buy':
+                logger.console(f'Buy of {data.order["symbol"]} ({data.order["filled_qty"]}) Cancelled.')
+                position.ready = 1
+            else:
+                try:
+                    id = f'{randint(1,99999999):08}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,9999):04}-{randint(1,999999999999):012}'
+                    position.update_order_ammount(
+                        data.order['client_order_id'], 0)
+#                     with ORDER_LOCK:
+                    logger.console(f'Re-Submitting sale of stock {symbol} for {data.order["filled_qty"]} ')
+                    o = api.submit_order(
+                        client_order_id=id, symbol=data.order['symbol'], qty=data.order['filled_qty'], side='sell',
+                        type='limit', time_in_force='day',
+                        limit_price=str(float(data.price) + 0.001)
+                    )
+                    # Approximate an IOC order by immediately cancelling
+                    # api.cancel_order(o.id)
+                    logger.trace(
+                        f'Updating order ammount of {o.client_order_id} to 0.')
+                    position.update_pending_sell_shares(args.quantity)
+                    logger.trace(
+                        f'Updated position: {position.orders_filled_amount}')
+                except Exception as e:
+                    logger.trace(e)
+                    logger.console(e)
 
     conn.run(
         ['trade_updates', tc, qc]
